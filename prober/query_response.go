@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
 	pconfig "github.com/prometheus/common/config"
@@ -28,21 +29,41 @@ import (
 	"github.com/prometheus/blackbox_exporter/config"
 )
 
-func probeExpectInfo(registry *prometheus.Registry, qr *config.QueryResponse, bytes []byte, match []int) {
-	var names []string
-	var values []string
-	for _, s := range qr.Labels {
-		names = append(names, s.Name)
-		values = append(values, string(qr.Expect.Expand(nil, []byte(s.Value), bytes, match)))
+// queryResponseLabelNames collects the union of all label names across every
+// query_response entry that defines labels, returning them in sorted order.
+// Registering probe_expect_info once with this combined set avoids a panic
+// when two entries define labels with different names (see GitHub #1526).
+func queryResponseLabelNames(qrs []config.QueryResponse) []string {
+	seen := make(map[string]struct{})
+	for _, qr := range qrs {
+		for _, l := range qr.Labels {
+			seen[l.Name] = struct{}{}
+		}
 	}
-	metric := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "probe_expect_info",
-			Help: "Explicit content matched",
-		},
-		names,
-	)
-	registry.MustRegister(metric)
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// probeExpectInfo records the captured label values for a single query_response
+// match into the pre-registered metric vec.  Labels not present in this
+// particular entry are emitted as empty strings so that WithLabelValues always
+// receives exactly len(allNames) values.
+func probeExpectInfo(metric *prometheus.GaugeVec, allNames []string, qr *config.QueryResponse, data []byte, match []int) {
+	// Build a lookup of name → expanded value for this entry.
+	entryValues := make(map[string]string, len(qr.Labels))
+	for _, s := range qr.Labels {
+		entryValues[s.Name] = string(qr.Expect.Expand(nil, []byte(s.Value), data, match))
+	}
+
+	// Emit in the canonical order (allNames) so WithLabelValues is correct.
+	values := make([]string, len(allNames))
+	for i, name := range allNames {
+		values[i] = entryValues[name] // "" when not present in this entry
+	}
 	metric.WithLabelValues(values...).Set(1)
 }
 
@@ -84,6 +105,22 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		queryResponses = module.Unix.QueryResponse
 		tlsConfig = &module.Unix.TLSConfig
 		useTLS = module.Unix.TLS
+	}
+
+	// Pre-register probe_expect_info with the union of all label names so that
+	// multiple query_response entries with different label sets do not cause a
+	// duplicate-registration panic (see GitHub #1526).
+	allLabelNames := queryResponseLabelNames(queryResponses)
+	var probeExpectInfoVec *prometheus.GaugeVec
+	if len(allLabelNames) > 0 {
+		probeExpectInfoVec = prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "probe_expect_info",
+				Help: "Explicit content matched",
+			},
+			allLabelNames,
+		)
+		registry.MustRegister(probeExpectInfoVec)
 	}
 
 	deadline, _ := ctx.Deadline()
@@ -128,7 +165,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			probeFailedDueToRegex.Set(0)
 			send = string(qr.Expect.Expand(nil, []byte(send), scanner.Bytes(), match))
 			if qr.Labels != nil {
-				probeExpectInfo(registry, &qr, scanner.Bytes(), match)
+				probeExpectInfo(probeExpectInfoVec, allLabelNames, &qr, scanner.Bytes(), match)
 			}
 		}
 		if qr.ExpectBytes != "" {

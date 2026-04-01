@@ -804,10 +804,16 @@ func TestProbeExpectInfo(t *testing.T) {
 			},
 		},
 	}
-	bytes := []byte("SSH-2.0-OpenSSH_6.9p1 Debian-2")
-	match := qr.Expect.FindSubmatchIndex(bytes)
+	data := []byte("SSH-2.0-OpenSSH_6.9p1 Debian-2")
+	match := qr.Expect.FindSubmatchIndex(data)
 
-	probeExpectInfo(registry, &qr, bytes, match)
+	allNames := queryResponseLabelNames([]config.QueryResponse{qr})
+	metric := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{Name: "probe_expect_info", Help: "Explicit content matched"},
+		allNames,
+	)
+	registry.MustRegister(metric)
+	probeExpectInfo(metric, allNames, &qr, data, match)
 
 	mfs, err := registry.Gather()
 	if err != nil {
@@ -821,5 +827,102 @@ func TestProbeExpectInfo(t *testing.T) {
 		},
 	}
 	checkRegistryLabels(expectedLabels, mfs, t)
+}
 
+// TestTCPConnectionQueryResponseMultipleLabels is a regression test for
+// https://github.com/prometheus/blackbox_exporter/issues/1526.
+// Two query_response entries with *different* label names must not panic on
+// registration and must each emit their own probe_expect_info time-series with
+// the correct label values (the other entry's label is emitted as "").
+func TestTCPConnectionQueryResponseMultipleLabels(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Expect: config.MustNewRegexp("^HELLO (.+)$"),
+					Labels: []config.Label{
+						{Name: "greeting", Value: "${1}"},
+					},
+				},
+				{
+					Expect: config.MustNewRegexp("^WORLD (.+)$"),
+					Labels: []config.Label{
+						{Name: "subject", Value: "${1}"},
+					},
+				},
+			},
+		},
+	}
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		fmt.Fprintf(conn, "HELLO earth\n")
+		fmt.Fprintf(conn, "WORLD humans\n")
+	}()
+
+	registry := prometheus.NewRegistry()
+	// Must not panic.
+	if !ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module failed, expected success.")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both entries share the same probe_expect_info metric family but produce
+	// separate time-series.  Find the metric family and verify both series.
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "probe_expect_info" {
+			continue
+		}
+		found = true
+		// Expect two time-series: one per matched entry.
+		if got := len(mf.GetMetric()); got != 2 {
+			t.Fatalf("probe_expect_info: expected 2 time-series, got %d", got)
+		}
+		for _, m := range mf.GetMetric() {
+			lbls := make(map[string]string)
+			for _, lp := range m.GetLabel() {
+				lbls[lp.GetName()] = lp.GetValue()
+			}
+			greeting, hasGreeting := lbls["greeting"]
+			subject, hasSubject := lbls["subject"]
+			if !hasGreeting || !hasSubject {
+				t.Fatalf("probe_expect_info time-series missing expected labels: %v", lbls)
+			}
+			switch {
+			case greeting == "earth":
+				if subject != "" {
+					t.Errorf("expected subject=\"\" for greeting entry, got %q", subject)
+				}
+			case subject == "humans":
+				if greeting != "" {
+					t.Errorf("expected greeting=\"\" for subject entry, got %q", greeting)
+				}
+			default:
+				t.Errorf("unexpected probe_expect_info time-series: %v", lbls)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("probe_expect_info metric family not found in registry")
+	}
 }
